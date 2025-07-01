@@ -1,1 +1,4 @@
-python-telegram-bot==20.6\nrequests\npandas\npython-dotenv
+python-telegram-bot==20.6
+requests
+pandas
+python-dotenv
