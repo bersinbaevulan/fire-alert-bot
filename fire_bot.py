@@ -1,21 +1,20 @@
 """
-fire_bot.py — Telegram-бот NASA FIRMS
-• Каждую минуту ищет новые очаги в Казахстане (ISO-3 KAZ)
-• Отправляет только confidence = nominal|high
-• Суточная сводка в 11:00 UTC
+fire_bot.py  — бот NASA FIRMS для Казахстана
+• каждые 60 с: новые очаги confidence nominal|high (low/≤30 отброшены)
+• суточная сводка 11:00 UTC
 """
 
 import os, ssl, sqlite3, requests, pandas as pd
 from io import StringIO
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ── отключаем проверку TLS ──────────────────────────────────────────
+# ── TLS off (корп-сертификаты не мешают)
 ssl._create_default_https_context = ssl._create_unverified_context
 requests.packages.urllib3.disable_warnings()
 
-# ── переменные окружения (заданы в Render → Environment) ────────────
+# ── переменные Render (задать вручную в Dashboard → Environment)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID   = int(os.getenv("CHAT_ID"))
 MAP_KEY   = os.getenv("MAP_KEY")
@@ -26,81 +25,68 @@ SOURCES = [
     "MODIS_NRT", "LANDSAT_NRT"
 ]
 
-# ── база «уже отправленных» ─────────────────────────────────────────
+# ── база «уже отправленных»
 db = sqlite3.connect("seen.db")
 db.execute("CREATE TABLE IF NOT EXISTS seen(id TEXT PRIMARY KEY)")
-
 def make_uid(r):  return f"{r.acq_date}_{r.acq_time}_{r.latitude}_{r.longitude}"
 def risk(code):   return {"l":"низкий риск","n":"средний риск","h":"высокий риск"}.get(code.lower(),"?")
 
-# ── /help ───────────────────────────────────────────────────────────
-async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+# ── /help
+async def help_cmd(u:Update, c:ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
-        "ℹ️ Пояснения\n"
-        "• FRP – тепловая мощность очага (МВт).\n"
-        "• Риск (confidence) – доверие к детекции.\n"
-        "  Бот показывает только medium (n) и high (h).\n"
-        "  Low (l) отфильтрован.\n\n"
-        "Обновление – каждую минуту, суточная сводка – 11:00 UTC.\n"
+        "ℹ️ Бот NASA FIRMS (KAZ)\n"
+        "• FRP — тепловая мощность очага (МВт).\n"
+        "• Риск (confidence) — доверие к детекции.\n"
+        "  Бот присылает _только_ medium (n) и high (h); low/≤30 отфильтрованы.\n"
+        "• Обновление каждые 60 с, суточная сводка — 11:00 UTC.\n"
         "Каждая строка содержит ссылку на Google Maps."
     )
 
-
-# ── минутный опрос FIRMS ───────────────────────────────────────────
-async def poll_job(c: ContextTypes.DEFAULT_TYPE):
-    bot, now, new_pts = c.bot, datetime.utcnow(), []
+# ── минутный опрос
+async def poll(c:ContextTypes.DEFAULT_TYPE):
+    bot, now, new = c.bot, datetime.now(UTC), []
 
     for src in SOURCES:
         url = f"https://firms.modaps.eosdis.nasa.gov/api/country/csv/{MAP_KEY}/{src}/KAZ/1"
         try:
-            csv_text = requests.get(url, timeout=TIMEOUT, verify=False).text
-            df = pd.read_csv(StringIO(csv_text))
-
-            # — фильтр: пропускаем low confidence —
-            df = df[df["confidence"].str.lower().isin(["n", "h"])]
-        except Exception as exc:
-            print("[WARN]", src, exc)
-            continue
+            df = pd.read_csv(StringIO(requests.get(url, timeout=TIMEOUT, verify=False).text))
+            # оставить только nominal/high
+            conf = df["confidence"].astype(str).str.lower()
+            mask = conf.isin(["n","h"]) | (conf.str.isnumeric() & (conf.astype(int) > 30))
+            df = df[mask]
+        except Exception as e:
+            print("[WARN]", src, e); continue
 
         for _, r in df.iterrows():
-            if db.execute("SELECT 1 FROM seen WHERE id=?", (make_uid(r),)).fetchone():
-                continue
+            if db.execute("SELECT 1 FROM seen WHERE id=?", (make_uid(r),)).fetchone(): continue
             db.execute("INSERT INTO seen VALUES (?)", (make_uid(r),))
-            new_pts.append((r, src))
+            new.append((r, src))
     db.commit()
+    if not new: return
 
-    if not new_pts:
-        return
-
-    header = f"🔥 Очаги {now:%H:%M}-{(now+timedelta(minutes=1)):%H:%M} UTC — {len(new_pts)}"
-    lines  = [header]
-    for i, (r, src) in enumerate(new_pts[:10], 1):
-        link = f"https://maps.google.com/?q={r.latitude},{r.longitude}"
-        lines.append(
-            f"{i}) {r.latitude:.3f}°N {r.longitude:.3f}°E | {src.split('_')[0]} | "
-            f"FRP {r.frp:.0f} МВт | {risk(str(r.confidence)[0])} | {link}"
-        )
-    if len(new_pts) > 10:
-        lines.append(f"…и ещё {len(new_pts)-10} точек")
-
+    head = f"🔥 Очаги {now:%H:%M}-{(now+timedelta(minutes=1)):%H:%M} UTC — {len(new)}"
+    lines=[head]+[
+        f"{i}) {r.latitude:.3f}°N {r.longitude:.3f}°E | {src.split('_')[0]} | "
+        f"FRP {r.frp:.0f} МВт | {risk(str(r.confidence)[0])} | "
+        f"https://maps.google.com/?q={r.latitude},{r.longitude}"
+        for i,(r,src) in enumerate(new[:10],1)]
+    if len(new)>10: lines.append(f"…и ещё {len(new)-10} точек")
     await bot.send_message(chat_id=CHAT_ID, text="\n".join(lines))
 
-# ── суточная сводка ────────────────────────────────────────────────
-async def daily_job(c: ContextTypes.DEFAULT_TYPE):
-    since = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
-    cnt = db.execute("SELECT COUNT(*) FROM seen WHERE id LIKE ?", (f"{since}%",)).fetchone()[0]
-    await c.bot.send_message(chat_id=CHAT_ID, text=f"📊 Итоги за сутки: {cnt} очагов")
+# ── суточная сводка
+async def daily(c):
+    since=(datetime.now(UTC)-timedelta(days=1)).strftime("%Y-%m-%d")
+    cnt=db.execute("SELECT COUNT(*) FROM seen WHERE id LIKE ?", (f"{since}%",)).fetchone()[0]
+    await c.bot.send_message(CHAT_ID, f"📊 Итоги за сутки: {cnt} очагов")
 
-# ── запуск приложения ─────────────────────────────────────────────
+# ── запуск
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("help", help_cmd))
-
     jq = app.job_queue
-    jq.run_repeating(poll_job, interval=60, first=10)
-    jq.run_daily(daily_job, time=datetime.strptime("11:00","%H:%M").time())
-
-    print("[START] bot on Render — low risk фильтруется")
+    jq.run_repeating(poll, 60, first=10)
+    jq.run_daily(daily, time=datetime.strptime("11:00","%H:%M").time())
+    print("[START] bot — only medium/high risks")
     app.run_polling(stop_signals=None)
 
 if __name__ == "__main__":
