@@ -1,11 +1,3 @@
-# ⬇️ Устанавливаем зависимости
-!pip -q install python-telegram-bot==20.6 requests pandas python-dotenv
-
-# ⬇️ Задаём переменные окружения (замените на свои значения)
-%env BOT_TOKEN=123456:ABC...      # токен @BotFather
-%env CHAT_ID=987654321            # ID чата или группы (для группы начинайте с -100…)
-%env MAP_KEY=abcd1234...          # FIRMS Map Key
-
 # ⬇️ Сам бот — вставлен целиком
 import os, ssl, sqlite3, requests, pandas as pd, time
 from io import StringIO
