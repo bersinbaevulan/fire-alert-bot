@@ -79,6 +79,35 @@ async def daily(c):
     cnt=db.execute("SELECT COUNT(*) FROM seen WHERE id LIKE ?", (f"{since}%",)).fetchone()[0]
     await c.bot.send_message(CHAT_ID, f"📊 Итоги за сутки: {cnt} очагов")
 
+
+# ── простейший HTTP-сервер, чтобы Render увидел открытый порт
+from aiohttp import web
+import asyncio, threading, os
+
+async def _pong(request):  # health-check
+    return web.Response(text="bot alive")
+
+def start_web_server():
+    port = int(os.getenv("PORT", "8000"))
+    app = web.Application()
+    app.router.add_get("/", _pong)
+    runner = web.AppRunner(app)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    async def _run():
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        print(f"[HTTP] health-check on :{port}")
+        while True:
+            await asyncio.sleep(3600)
+
+    loop.run_until_complete(_run())
+
+# запускаем в отдельном потоке
+threading.Thread(target=start_web_server, daemon=True).start()
+
 # ── запуск
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
